@@ -8,7 +8,9 @@
 
 ```
 fixtures/                 输入：files.json、queries.json、stats.parquet、no-stats.parquet
+  occupancy/{main,shifted,transitivity}/  占位冲突与交付示例（事件 + 规则 + values.json）
 tools/make_fixtures.py    从同一份数据生成“有统计/无统计”两个 Parquet（行组与行序一致）
+tools/make_occupancy_fixtures.py  生成占位冲突/交付示例夹具
 src/pqscan/
   expr.py       谓词树解析、schema 校验、PyArrow 表达式翻译、纯 Python 3VL 逐行求值
   stats.py      只读 footer 的行组统计提取与可靠性判定
@@ -16,8 +18,10 @@ src/pqscan/
   scanner.py    两阶段列读取、精确行选择、读取请求在执行入口即时登记
   reference.py  独立核对：无剪枝全扫描 + 纯 Python 3VL（与引擎不同代码路径）
   runner.py     串联计划/扫描/核对，落盘 plans、results、run_record、verification
-  cli.py        命令行入口
-tests/          pytest 套件（12 个用例）
+  occupancy.py  业务入口一：按 (工单号, 配对号) 重建占位区间 + 独立冲突清单
+  delivery.py   业务入口二：基于冲突清单求最大价值可同时交付集合（精确、平局定序）
+  cli.py        命令行入口（run / verify / occupancy / deliver）
+tests/          pytest 套件（35 个用例）
 docs/plan_format.md  计划与运行记录的 JSON 格式契约
 output/         运行产物（git 忽略）
 ```
@@ -36,7 +40,6 @@ PYTHONPATH=src .venv/bin/python -m pytest tests/ -q
 `output/run_record.json`（实际列读取请求）、`output/verification.json`（独立核对结论）。
 
 ## 支持范围
-
 - 平面 schema；整数（有/无符号 int32/int64 等）与字符串列；
 - 比较 `eq/ne/lt/le/gt/ge`、`is_null`、`and/or/not`、列投影；
 - 谓词以 JSON 前缀树表达（见 `fixtures/queries.json`），不解析 SQL；
@@ -85,9 +88,83 @@ PYTHONPATH=src .venv/bin/python -m pytest tests/ -q
 `no_hits_after_filter` 行组只有 `phase=filter` 的请求，从不读取投影专用列
 （`row_id/payload/kind/amount`）；`planned_skip` 行组零请求。
 
+## 业务入口：占位冲突与可同时交付工单
+
+在上面通用 plan/scan 之外，新增两个可分别使用的**离线业务入口**，互不依赖对方的
+实现细节，只通过一份冲突清单交接。原 `run`/`verify` 接口与其物理行溯源完全保留。
+
+事件与规则的 Parquet schema：
+
+- 事件（一个或多个文件）：`work_order, fixture, station, pair_id, kind, ts`，
+  其中 `kind ∈ {IN, OUT}`，`ts` 为整数时刻。
+- 规则（一个或多个文件）：`fixture, station_a, station_b`，一行声明同台两工位互斥。
+
+### 入口一：重建占位区间 + 冲突清单
+
+```bash
+PYTHONPATH=src .venv/bin/python -m pqscan.cli occupancy \
+    --events fixtures/occupancy/main/events1.parquet fixtures/occupancy/main/events2.parquet \
+    --rules fixtures/occupancy/main/rules.parquet \
+    --out output/occ_main
+```
+
+- 按 `(工单号, 进退配对号)` 重建**真实占位区间**：一张工单中途退站又返回时
+  是多个不连续区间，绝不从第一次进入一路占到末次离开；进入/离开可跨文件、
+  跨行组、乱序，靠配对号而非位置关联。
+- 每对必须恰好一个 `IN`、一个 `OUT`，且离开时刻**严格晚于**进入时刻，
+  区间为半开 `[进入, 离开)`：**时间相接不算冲突**。
+- 缺端、同一端内容矛盾、同端重复、进出夹具/工位不一致、时刻倒置，均单列进
+  `malformed` 并带全部出处；**只要一张工单有任一配对错误，该工单整单不参加交付**。
+- 冲突判定：同一夹具下，同工位（无需规则）或规则声明互斥的两工位，且区间内部
+  重叠。互斥对**无向且不传递**（只声明 X-Y、Y-Z 时 X 与 Z 不互斥）。
+- 产物 `occupancy.json` 含 `intervals`、`malformed`、`conflicts`、`interfering_pairs`。
+  每条冲突给出工单对、作为证据的**配对号**、**实际交叠区间**、依据（同工位/规则）
+  及其物理出处（文件、行组、组内行号）。
+
+### 入口二：选择最大价值可同时交付集合
+
+```bash
+PYTHONPATH=src .venv/bin/python -m pqscan.cli deliver \
+    --conflicts output/occ_main/occupancy.json \
+    --values fixtures/occupancy/main/values.json \
+    --out output/del_main
+# 也可指定必须项：--required A
+```
+
+- 读取入口一的合格工单与冲突清单，加上每张工单的正整数价值、必须交付集合；
+  返回总价值最大的可同时交付整单集合，**同价值取升序工单号列表字典序最小者**。
+- 冲突是工单对级硬约束（不传递），用位掩码分支定界**精确**求解，适用最多 20 张
+  合格工单，按批离线算。
+- 必须项之间冲突时，整单请求被拒绝（退出码 3），写出 `rejection.json` 指出冲突
+  出处；必须项不在合格工单中、价值缺失/非正同样报错。
+- 价值或必须项改变时，可直接**复用同一份 `occupancy.json`** 重新报价，无需重读
+  事件/规则 Parquet。
+
+### 夹具与可复跑结果
+
+```bash
+.venv/bin/python tools/make_occupancy_fixtures.py   # 生成 fixtures/occupancy/**
+```
+
+| 场景 | 事件 | 期望交付 |
+| --- | --- | --- |
+| `main`：A 占 `[0,2)`+`[6,8)`，B `[1,3)`，C `[5,7)`，价值 5/3/3 | `events1/events2` | `B, C`（价值 6） |
+| `main` 且 `--required A` | 同上 | `A`（价值 5） |
+| `shifted`：A 第二段改为 `[7,8)`，恰好接在 C 之后 | `events` | `A, C`（价值 8） |
+| `transitivity`：同台 X/Y/Z 只声明 X-Y、Y-Z | `events` | `WX, WZ`（X 与 Z 同交付） |
+| `main` 且 `--required A B`（两必须项冲突） | 同上 | 拒绝，指出 A×B 交叠 `[1,2)` |
+
+`main` 另含 M1/M2/M3 三个配对错误工单（缺端、同端矛盾、整单排除），验证
+`malformed` 出处与“整单不参加交付”。
+
 ## 测试覆盖
 
 `tests/test_pqscan.py`（12 用例）覆盖：范围剪枝、全 NULL 组、IS NULL 的
 null_count 推理、NOT 的 UNKNOWN 处理与可证明 FALSE、OR 跨列不关联极值、
 无统计全保留、3VL 真值表、无命中不读投影列、过滤列复用、端到端与无剪枝
 全扫描一致、有/无统计结果相同而计划保守度不同、空结果 schema 与输出顺序。
+
+`tests/test_occupancy_delivery.py`（23 用例）覆盖：多段占位不合并、跨文件/乱序配对、
+缺端与同端矛盾/倒置的单列与整单排除、时间相接不冲突、同工位与无向规则、规则不传递、
+题目三个数值示例、字典序平局、必须项冲突拒绝、冲突清单复用，以及与暴力枚举在随机图
+和 20 张链式冲突图上的一致性。
